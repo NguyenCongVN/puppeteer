@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [16.0.0](https://github.com/puppeteer/puppeteer/compare/v15.5.0...v16.0.0) (2022-07-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* With Chromium, Puppeteer will now attach to page/iframe targets immediately. Browser.connect requires an explicit product name when connecting to Firefox since Firefox does not support CDP's auto-attach.
+
+### Features
+
+* use CDP's auto-attach mechanism ([#8520](https://github.com/puppeteer/puppeteer/issues/8520)) ([e1e751d](https://github.com/puppeteer/puppeteer/commit/e1e751dd1a47b05dd2db36a65e91a2f53d9c88ae))
+
 ## [15.5.0](https://github.com/puppeteer/puppeteer/compare/v15.4.2...v15.5.0) (2022-07-21)
 
 
