@@ -33,6 +33,38 @@ import {debugError, isErrorLike} from './util.js';
 
 const UTILITY_WORLD_NAME = '__puppeteer_utility_world__';
 
+type Resolvable<T> = {
+  promise: Promise<T>;
+  resolve: (_: T) => void;
+  reject: (_: Error) => void;
+};
+
+function createPromiseResolverWithTimeout<T>(
+  timeout: number,
+  timeoutMessage: string
+): Resolvable<T> {
+  let resolver = (_: T): void => {};
+  let rejector = (_: Error) => {};
+  const taskPromise = new Promise<T>((resolve, reject) => {
+    resolver = resolve;
+    rejector = reject;
+  });
+  const timeoutId = setTimeout(() => {
+    rejector(new Error(timeoutMessage));
+  }, timeout);
+  return {
+    promise: taskPromise,
+    resolve: (value: T) => {
+      clearTimeout(timeoutId);
+      resolver(value);
+    },
+    reject: (err: Error) => {
+      clearTimeout(timeoutId);
+      rejector(err);
+    },
+  };
+}
+
 /**
  * We use symbols to prevent external parties listening to these events.
  * They are internal to Puppeteer.
@@ -64,6 +96,8 @@ export class FrameManager extends EventEmitter {
   #isolatedWorlds = new Set<string>();
   #mainFrame?: Frame;
   #client: CDPSession;
+  #pendingFrameTargets = new Map<string, Resolvable<void>>();
+  #framesPendingAttachment = new Map<string, Resolvable<void>>();
 
   /**
    * @internal
@@ -132,8 +166,20 @@ export class FrameManager extends EventEmitter {
     });
   }
 
-  async initialize(client: CDPSession = this.#client): Promise<void> {
+  async initialize(
+    targetId: string,
+    client: CDPSession = this.#client
+  ): Promise<void> {
     try {
+      if (!this.#pendingFrameTargets.has(targetId)) {
+        this.#pendingFrameTargets.set(
+          targetId,
+          createPromiseResolverWithTimeout(
+            2000,
+            `Waiting for target frame ${targetId} failed`
+          )
+        );
+      }
       const result = await Promise.all([
         client.send('Page.enable'),
         client.send('Page.getFrameTree'),
@@ -162,6 +208,9 @@ export class FrameManager extends EventEmitter {
       }
 
       throw error;
+    } finally {
+      this.#pendingFrameTargets.get(targetId)?.resolve();
+      this.#pendingFrameTargets.delete(targetId);
     }
   }
 
@@ -262,7 +311,7 @@ export class FrameManager extends EventEmitter {
       frame._updateClient(target._session()!);
     }
     this.setupEventListeners(target._session()!);
-    this.initialize(target._session());
+    this.initialize(target._getTargetInfo().targetId, target._session());
   }
 
   async onDetachedFromTarget(target: Target): Promise<void> {
@@ -341,7 +390,7 @@ export class FrameManager extends EventEmitter {
   #onFrameAttached(
     session: CDPSession,
     frameId: string,
-    parentFrameId?: string
+    parentFrameId: string
   ): void {
     if (this.#frames.has(frameId)) {
       const frame = this.#frames.get(frameId)!;
@@ -353,50 +402,85 @@ export class FrameManager extends EventEmitter {
       }
       return;
     }
-    assert(parentFrameId);
     const parentFrame = this.#frames.get(parentFrameId);
-    assert(parentFrame, `Parent frame ${parentFrameId} not found`);
-    const frame = new Frame(this, parentFrame, frameId, session);
-    this.#frames.set(frame._id, frame);
-    this.emit(FrameManagerEmittedEvents.FrameAttached, frame);
+
+    const complete = (parentFrame: Frame) => {
+      assert(parentFrame, `Parent frame ${parentFrameId} not found`);
+      const frame = new Frame(this, parentFrame, frameId, session);
+      this.#frames.set(frame._id, frame);
+      this.emit(FrameManagerEmittedEvents.FrameAttached, frame);
+    };
+
+    if (parentFrame) {
+      return complete(parentFrame);
+    }
+
+    if (this.#pendingFrameTargets.has(parentFrameId)) {
+      if (!this.#framesPendingAttachment.has(frameId)) {
+        this.#framesPendingAttachment.set(
+          frameId,
+          createPromiseResolverWithTimeout(
+            2000,
+            `Waiting for frame ${frameId} to attach failed`
+          )
+        );
+      }
+      this.#pendingFrameTargets.get(parentFrameId)!.promise.then(() => {
+        complete(this.#frames.get(parentFrameId)!);
+        this.#framesPendingAttachment.get(frameId)?.resolve();
+        this.#framesPendingAttachment.delete(frameId);
+      });
+      return;
+    }
+
+    throw new Error(`Parent frame ${parentFrameId} not found`);
   }
 
   #onFrameNavigated(framePayload: Protocol.Page.Frame): void {
+    const frameId = framePayload.id;
     const isMainFrame = !framePayload.parentId;
-    let frame = isMainFrame
-      ? this.#mainFrame
-      : this.#frames.get(framePayload.id);
-    assert(
-      isMainFrame || frame,
-      'We either navigate top level or have old version of the navigated frame'
-    );
+    const frame = isMainFrame ? this.#mainFrame : this.#frames.get(frameId);
 
-    // Detach all child frames first.
-    if (frame) {
-      for (const child of frame.childFrames()) {
-        this.#removeFramesRecursively(child);
-      }
-    }
+    const complete = (frame?: Frame) => {
+      assert(
+        isMainFrame || frame,
+        `Missing frame isMainFrame=${isMainFrame}, frameId=${frameId}`
+      );
 
-    // Update or create main frame.
-    if (isMainFrame) {
+      // Detach all child frames first.
       if (frame) {
-        // Update frame id to retain frame identity on cross-process navigation.
-        this.#frames.delete(frame._id);
-        frame._id = framePayload.id;
-      } else {
-        // Initial main frame navigation.
-        frame = new Frame(this, null, framePayload.id, this.#client);
+        for (const child of frame.childFrames()) {
+          this.#removeFramesRecursively(child);
+        }
       }
-      this.#frames.set(framePayload.id, frame);
-      this.#mainFrame = frame;
+
+      // Update or create main frame.
+      if (isMainFrame) {
+        if (frame) {
+          // Update frame id to retain frame identity on cross-process navigation.
+          this.#frames.delete(frame._id);
+          frame._id = frameId;
+        } else {
+          // Initial main frame navigation.
+          frame = new Frame(this, null, frameId, this.#client);
+        }
+        this.#frames.set(frameId, frame);
+        this.#mainFrame = frame;
+      }
+
+      // Update frame payload.
+      assert(frame);
+      frame._navigated(framePayload);
+
+      this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
+    };
+    if (this.#framesPendingAttachment.has(frameId)) {
+      this.#framesPendingAttachment.get(frameId)!.promise.then(() => {
+        complete(isMainFrame ? this.#mainFrame : this.#frames.get(frameId));
+      });
+    } else {
+      complete(frame);
     }
-
-    // Update frame payload.
-    assert(frame);
-    frame._navigated(framePayload);
-
-    this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
   }
 
   async _ensureIsolatedWorld(session: CDPSession, name: string): Promise<void> {
