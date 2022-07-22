@@ -653,4 +653,53 @@ export class Touchscreen {
       modifiers: this.#keyboard._modifiers,
     });
   }
+
+
+  /**
+   * @param {!{x?: number, y?: number}=} start
+   * @param {!{x?: number, y?: number}=} end
+   * @param {!{steps?: number}=} options
+   */
+   async swipe(start : {x : number , y : number}, end : {x : number , y :number}, options : {steps? : number} = {}) {
+    const { steps = 1 } = options;
+    const _start = { x: Math.round(start.x), y: Math.round(start.y) };
+    const _end = { x: Math.round(end.x), y: Math.round(end.y) };
+
+    // Touches appear to be lost during the first frame after navigation.
+    // This waits a frame before sending the tap.
+    // @see https://crbug.com/613219
+    await this.#client.send("Runtime.evaluate", {
+      expression:
+        "new Promise(x => requestAnimationFrame(() => requestAnimationFrame(x)))",
+      awaitPromise: true
+    });
+
+    await this.#client.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [_start],
+      modifiers: this.#keyboard._modifiers
+    });
+
+    for (let i = 1; i <= steps; i++) {
+      await this.#client.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [
+          {
+            x: _start.x + (_end.x - _start.x) * (i / steps),
+            y: _start.y + (_end.y - _start.y) * (i / steps)
+          }
+        ],
+        modifiers: this.#keyboard._modifiers
+      });
+    }
+
+    await this.#client.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+      modifiers: this.#keyboard._modifiers
+    });
+  }
+
+
+
 }
