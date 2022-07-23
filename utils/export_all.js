@@ -13,7 +13,11 @@ for (const file of readdirSync(join(__dirname, `../src`)).filter(filename => {
     !EXCLUDE_FILES.includes(filename)
   );
 })) {
-  typesTs += `export * from './${basename(file, '.ts')}.js';\n`;
+  if (file.includes('.d.ts')) {
+    typesTs += `export * from './${basename(file, '.d.ts')}.js';\n`;
+  } else {
+    typesTs += `export * from './${basename(file, '.ts')}.js';\n`;
+  }
 }
 
 for (const folder of ['common', 'node', 'generated']) {
